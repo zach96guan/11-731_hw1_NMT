@@ -1,0 +1,7 @@
+Dev
+zachguan@instance-1:~/11-731_NMT$ perl multi-bleu.perl data/valid.de-en.en < output/decode_dev.txt
+BLEU = 26.89, 62.3/35.2/21.4/13.3 (BP=0.958, ratio=0.959, hyp_len=123745, ref_len=129091)
+
+Test
+zachguan@instance-1:~/11-731_NMT$ perl multi-bleu.perl data/test.de-en.en < output/decode_test.txt
+BLEU = 25.06, 60.3/32.8/19.5/11.9 (BP=0.963, ratio=0.964, hyp_len=126395, ref_len=131141)
