@@ -1,5 +1,8 @@
 # coding=utf-8
 
+# 11-731 hw1
+# Author: Zehao Guan (zehaog)
+
 """
 A very basic implementation of neural machine translation
 
@@ -35,26 +38,38 @@ Options:
     --max-decoding-time-step=<int>          maximum number of decoding time steps [default: 70]
 """
 
+
 import math
 import pickle
 import sys
 import time
 from collections import namedtuple
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import Variable
+from torch import optim
+from torch.nn import Parameter
+from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence, pack_sequence, pad_sequence
+
 import numpy as np
+import random
 from typing import List, Tuple, Dict, Set, Union
 from docopt import docopt
 from tqdm import tqdm
 from nltk.translate.bleu_score import corpus_bleu, sentence_bleu, SmoothingFunction
 
-from utils import read_corpus, batch_iter
+from utils import read_corpus, batch_iter, input_transpose
 from vocab import Vocab, VocabEntry
 
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 Hypothesis = namedtuple('Hypothesis', ['value', 'score'])
 
 
-class NMT(object):
+class NMT(nn.Module):
 
     def __init__(self, embed_size, hidden_size, vocab, dropout_rate=0.2):
         super(NMT, self).__init__()
@@ -64,11 +79,26 @@ class NMT(object):
         self.dropout_rate = dropout_rate
         self.vocab = vocab
 
+        self.criterion = nn.CrossEntropyLoss(reduction='sum', ignore_index=0)
+        
         # initialize neural network layers...
+        self.src_embed = nn.Embedding(len(vocab.src), embed_size, padding_idx=vocab.src.word2id['<pad>'])
+        self.tgt_embed = nn.Embedding(len(vocab.tgt), embed_size, padding_idx=vocab.tgt.word2id['<pad>'])
 
-    def __call__(self, src_sents: List[List[str]], tgt_sents: List[List[str]]) -> Tensor:
+        self.encoder = nn.LSTM(embed_size, hidden_size, bidirectional=True)
+        self.decoder = nn.LSTMCell(embed_size + hidden_size, hidden_size)
+
+        self.decoder_init_cell = nn.Linear(hidden_size * 2, hidden_size)
+        # self.dropout = nn.Dropout(dropout_rate)
+
+        self.key_mlp = nn.Linear(hidden_size * 2, hidden_size)
+        self.value_mlp = nn.Linear(hidden_size * 2, hidden_size)
+        self.output_mlp = nn.Linear(hidden_size * 2, len(vocab.tgt))
+        
+
+    def forward(self, src_sents: List[List[str]], tgt_sents: List[List[str]], mode=True):
         """
-        take a mini-batch of source and target sentences, compute the log-likelihood of 
+        take a mini-batch of source and target sentences, compute the log-likelihood of
         target sentences.
 
         Args:
@@ -76,16 +106,34 @@ class NMT(object):
             tgt_sents: list of target sentence tokens, wrapped by `<s>` and `</s>`
 
         Returns:
-            scores: a variable/tensor of shape (batch_size, ) representing the 
-                log-likelihood of generating the gold-standard target sentence for 
+            scores: a variable/tensor of shape (batch_size, ) representing the
+                log-likelihood of generating the gold-standard target sentence for
                 each example in the input batch
         """
-        src_encodings, decoder_init_state = self.encode(src_sents, tgt_sents)
-        scores = self.decode(src_encodings, decoder_init_state, tgt_sents)
+        src_encodings, src_lens, dec_init_state = self.encode(src_sents)
+        scores, padded_tgt = self.decode(src_encodings, src_lens, dec_init_state, tgt_sents)
 
-        return scores
+        loss = self.criterion(torch.transpose(scores, 1, 2), padded_tgt[:, 1:])
+        return loss
 
-    def encode(self, src_sents: List[List[str]]) -> Tuple[Tensor, Any]:
+
+    def sents2tensors(self, sents: List[List[str]], flag: bool):
+        """
+        :param flag: is True if sent is source; Otherwise, return False
+        """
+        # src
+        if flag:
+            src_token = self.vocab.src.words2indices(sents)
+            src_tensors = [torch.tensor(t) for t in src_token]
+            return src_tensors
+        # tgt
+        else:
+            tgt_token = self.vocab.tgt.words2indices(sents)
+            tgt_tensors = [torch.tensor(t) for t in tgt_token]
+            return tgt_tensors
+
+
+    def encode(self, src_sents: List[List[str]]):
         """
         Use a GRU/LSTM to encode source sentences into hidden states
 
@@ -93,14 +141,32 @@ class NMT(object):
             src_sents: list of source sentence tokens
 
         Returns:
-            src_encodings: hidden states of tokens in source sentences, this could be a variable 
+            src_encodings: hidden states of tokens in source sentences, this could be a variable
                 with shape (batch_size, source_sentence_length, encoding_dim), or in orther formats
             decoder_init_state: decoder GRU/LSTM's initial state, computed from source encodings
         """
+        src_tensors = self.sents2tensors(src_sents, True)
+        src_lens = [len(s) for s in src_sents]
+        # (L, B, E)
+        padded_src = pad_sequence(src_tensors)
+        padded_src = padded_src.to(device)
 
-        return src_encodings, decoder_init_state
+        # (L, B, E)
+        embed_src = self.src_embed(padded_src)
+        embed_src = pack_padded_sequence(embed_src, torch.tensor(src_lens), batch_first=False)
 
-    def decode(self, src_encodings: Tensor, decoder_init_state: Any, tgt_sents: List[List[str]]) -> Tensor:
+        enc_out, (h0, c0) = self.encoder(embed_src)
+        # (L, B, H)
+        output, _ = pad_packed_sequence(enc_out)
+
+        # init for decoder
+        dec_init_cell = self.decoder_init_cell(torch.cat([c0[0], c0[1]], 1))
+        dec_init_state = torch.tanh(dec_init_cell)
+
+        return output, src_lens, (dec_init_state, dec_init_cell)
+
+
+    def decode(self, src_encodings, src_lens, decoder_init_state, tgt_sents: List[List[str]], mode=True):
         """
         Given source encodings, compute the log-likelihood of predicting the gold-standard target
         sentence tokens
@@ -111,59 +177,169 @@ class NMT(object):
             tgt_sents: list of gold-standard target sentences, wrapped by `<s>` and `</s>`
 
         Returns:
-            scores: could be a variable of shape (batch_size, ) representing the 
-                log-likelihood of generating the gold-standard target sentence for 
+            scores: could be a variable of shape (batch_size, ) representing the
+                log-likelihood of generating the gold-standard target sentence for
                 each example in the input batch
         """
+        tgt_tensors = self.sents2tensors(tgt_sents, False)
+        tgt_lens = [len(s) for s in tgt_sents]
+        padded_tgt = pad_sequence(tgt_tensors, batch_first=True)
+        padded_tgt = padded_tgt.to(device)
 
-        return scores
+        h, cell = decoder_init_state
+        batch_size = padded_tgt.shape[0]
+        embed_size = padded_tgt.shape[1]
 
-    def beam_search(self, src_sent: List[str], beam_size: int=5, max_decoding_time_step: int=70) -> List[Hypothesis]:
+        # (B, L, E)
+        embed_tgt = self.tgt_embed(padded_tgt)
+
+        key = self.key_mlp(src_encodings)
+        value = self.value_mlp(src_encodings)
+        # (B, H)
+        ctx = torch.zeros((batch_size, self.hidden_size))
+        ctx = ctx.to(device)
+
+        # get mask
+        mask = torch.zeros((batch_size, key.size(0)))
+        mask = mask.to(device)
+        for i in range(mask.size(0)):
+            for j in range(src_lens[i]):
+                mask[i][j] = 1.0
+
+        # (B, H, L)
+        key = key.permute(1, 2, 0)
+        # (B, L, H)
+        value = value.permute(1, 0, 2)
+
+        scores = []
+        teacher_forcing_rate = 0.1
+
+        for i in range(embed_size - 1):
+            # teacher forcing
+            if mode:
+                if i == 0 or np.random.random() >= teacher_forcing_rate:
+                    inp = embed_tgt[:, i, :]
+                else:
+                    inp = self.tgt_embed(torch.argmax(score_t.squeeze(1), 1))
+                
+            else:
+                inp = self.tgt_embed(torch.argmax(score_t.squeeze(1), 1))
+            
+            x = torch.cat((inp, ctx), 1)
+            h_t, cell_t = self.decoder(x, (h, cell))
+            output = query = h_t.unsqueeze(1)
+
+            # attention
+            energy = torch.bmm(query, key)
+            attn = F.softmax(energy, dim=2)
+            mask_attn = F.normalize(attn * mask.unsqueeze(1), p=1, dim=2)
+
+            ctx = torch.bmm(mask_attn, value)
+            score_t = self.output_mlp(torch.cat((ctx, output), dim=2))
+            scores.append(score_t)
+
+            ctx = ctx.squeeze(1)
+            h, cell = h_t, cell_t
+
+        scores = torch.cat(scores, 1)
+
+        return scores, padded_tgt
+
+
+    def greedy_search(self, src_sent, max_decoding_time_step=70):
         """
-        Given a single source sentence, perform beam search
+        Given a single source sentence, perform greedy search
 
         Args:
             src_sent: a single tokenized source sentence
-            beam_size: beam size
             max_decoding_time_step: maximum number of time steps to unroll the decoding RNN
 
         Returns:
-            hypotheses: a list of hypothesis, each hypothesis has two fields:
-                value: List[str]: the decoded target sentence, represented as a list of words
-                score: float: the log-likelihood of the target sentence
+             value: List[str]: the decoded target sentence, represented as a list of words
         """
+        src_encodings, src_lens, (h_t, cell_t) = self.encode([src_sent])
+        h, cell = h_t, cell_t
+
+        key = self.key_mlp(src_encodings)
+        value = self.value_mlp(src_encodings)
+        ctx = torch.zeros((1, self.hidden_size))
+        ctx = ctx.to(device)
+
+        mask = torch.zeros((1, key.shape[0]))
+        mask = mask.to(device)
+        for i in range(mask.shape[0]):
+            for j in range(src_lens[i]):
+                mask[i][j] = 1.0
+
+        key = key.permute(1, 2, 0)
+        value = value.permute(1, 0, 2)
+
+        out = torch.tensor([1]).to(device)
+        # output indices
+        preds = [1]
+        pos = 0
+
+        # follow the decoder part, change mode and input size
+        while pos < max_decoding_time_step and preds[-1] != self.vocab.tgt.word2id['</s>']:
+            pos += 1
+
+            inp = self.tgt_embed(out)
+            x = torch.cat((inp, ctx), 1)
+
+            h_t, cell_t = self.decoder(x, (h, cell)) 
+            output = query = h_t.unsqueeze(1)
+
+            energy = torch.bmm(query, key)
+            attn = F.softmax(energy, dim=2)
+            mask_attn = F.normalize(attn * mask.unsqueeze(1), p=1, dim=2)
+
+            ctx = torch.bmm(mask_attn, value)
+            score_t = self.output_mlp(torch.cat((ctx, output), 2))
+
+            # greedy-search
+            out = torch.argmax(score_t.squeeze(1), dim=1)
+            preds.append(out.cpu().numpy()[0])
+
+            ctx = ctx.squeeze(1)
+            h, cell = h_t, cell_t
+            # torch.cuda.empty_cache()
+
+        hypotheses = []
+        for idx in preds[1:-1]:
+            hypotheses.append(self.vocab.tgt.id2word[idx])
 
         return hypotheses
 
-    def evaluate_ppl(self, dev_data: List[Any], batch_size: int=32):
+
+    def evaluate_ppl(self, dev_data, batch_size=32):
         """
         Evaluate perplexity on dev sentences
-
+    
         Args:
             dev_data: a list of dev sentences
             batch_size: batch size
-        
+
         Returns:
             ppl: the perplexity on dev sentences
         """
-
         cum_loss = 0.
         cum_tgt_words = 0.
 
         # you may want to wrap the following code using a context manager provided
         # by the NN library to signal the backend to not to keep gradient information
         # e.g., `torch.no_grad()`
+        with torch.no_grad():
+            for src_sents, tgt_sents in batch_iter(dev_data, batch_size):
+                loss = self.forward(src_sents, tgt_sents, mode=False)
 
-        for src_sents, tgt_sents in batch_iter(dev_data, batch_size):
-            loss = -model(src_sents, tgt_sents).sum()
+                cum_loss += loss.item()
+                tgt_word_num_to_predict = sum(len(s[1:]) for s in tgt_sents)  # omitting the leading `<s>`
+                cum_tgt_words += tgt_word_num_to_predict
 
-            cum_loss += loss
-            tgt_word_num_to_predict = sum(len(s[1:]) for s in tgt_sents)  # omitting the leading `<s>`
-            cum_tgt_words += tgt_word_num_to_predict
-
-        ppl = np.exp(cum_loss / cum_tgt_words)
+            ppl = np.exp(cum_loss / cum_tgt_words)
 
         return ppl
+
 
     @staticmethod
     def load(model_path: str):
@@ -173,15 +349,14 @@ class NMT(object):
         Returns:
             model: the loaded model
         """
+        return torch.load(model_path)
 
-        return model
 
     def save(self, path: str):
         """
         Save current model to file
         """
-
-        raise NotImplementedError()
+        torch.save(model, path)
 
 
 def compute_corpus_level_bleu_score(references: List[List[str]], hypotheses: List[Hypothesis]) -> float:
@@ -219,13 +394,21 @@ def train(args: Dict[str, str]):
     valid_niter = int(args['--valid-niter'])
     log_every = int(args['--log-every'])
     model_save_path = args['--save-to']
+    lr = float(args['--lr'])
+    lr_decay = float(args['--lr-decay'])
 
-    vocab = pickle.load(open(args['--vocab'], 'rb'))
+    vocab = pickle.load(open(args['--vocab'], 'rb'), encoding="utf-8")
 
     model = NMT(embed_size=int(args['--embed-size']),
                 hidden_size=int(args['--hidden-size']),
                 dropout_rate=float(args['--dropout']),
-                vocab=vocab)
+                vocab=vocab).to(device)
+
+    # uniform-init
+    for param in model.parameters():
+        param.data.uniform_(-0.1, 0.1) 
+
+    optim = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-6)
 
     num_trial = 0
     train_iter = patience = cum_loss = report_loss = cumulative_tgt_words = report_tgt_words = 0
@@ -233,21 +416,21 @@ def train(args: Dict[str, str]):
     hist_valid_scores = []
     train_time = begin_time = time.time()
     print('begin Maximum Likelihood training')
-
+    
     while True:
         epoch += 1
 
         for src_sents, tgt_sents in batch_iter(train_data, batch_size=train_batch_size, shuffle=True):
             train_iter += 1
-
             batch_size = len(src_sents)
-
-            # (batch_size)
-            loss = -model(src_sents, tgt_sents)
-
-            report_loss += loss
-            cum_loss += loss
-
+        
+            optim.zero_grad()
+            loss = model(src_sents, tgt_sents)
+            report_loss += loss.item()
+            cum_loss += loss.item()
+            loss.backward()
+            optim.step()
+            
             tgt_words_num_to_predict = sum(len(s[1:]) for s in tgt_sents)  # omitting leading `<s>`
             report_tgt_words += tgt_words_num_to_predict
             cumulative_tgt_words += tgt_words_num_to_predict
@@ -284,7 +467,7 @@ def train(args: Dict[str, str]):
                 print('begin validation ...', file=sys.stderr)
 
                 # compute dev. ppl and bleu
-                dev_ppl = model.evaluate_ppl(dev_data, batch_size=128)   # dev batch size can be a bit larger
+                dev_ppl = model.evaluate_ppl(dev_data, batch_size=256)   # dev batch size can be a bit larger
                 valid_metric = -dev_ppl
 
                 print('validation: iter %d, dev. ppl %f' % (train_iter, dev_ppl), file=sys.stderr)
@@ -295,7 +478,7 @@ def train(args: Dict[str, str]):
                 if is_better:
                     patience = 0
                     print('save currently the best model to [%s]' % model_save_path, file=sys.stderr)
-                    model.save(model_save_path)
+                    torch.save(model, model_save_path)
 
                     # You may also save the optimizer's state
                 elif patience < int(args['--patience']):
@@ -314,7 +497,8 @@ def train(args: Dict[str, str]):
                         print('load previously best model and decay learning rate to %f' % lr, file=sys.stderr)
 
                         # load model
-                        model_save_path
+                        model = torch.load(model_save_path)
+                        optim = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=lr_decay)
 
                         print('restore parameters of the optimizers', file=sys.stderr)
                         # You may also need to load the state of the optimizer saved before
@@ -327,21 +511,21 @@ def train(args: Dict[str, str]):
                     exit(0)
 
 
-def beam_search(model: NMT, test_data_src: List[List[str]], beam_size: int, max_decoding_time_step: int) -> List[List[Hypothesis]]:
-    was_training = model.training
+def greedy_search(model: NMT, test_data_src: List[List[str]], max_decoding_time_step: int):
+    with torch.no_grad():
 
-    hypotheses = []
-    for src_sent in tqdm(test_data_src, desc='Decoding', file=sys.stdout):
-        example_hyps = model.beam_search(src_sent, beam_size=beam_size, max_decoding_time_step=max_decoding_time_step)
+        hypotheses = []
+        for src_sent in tqdm(test_data_src, desc='Decoding', file=sys.stdout):
+            example_hyps = model.greedy_search(src_sent, max_decoding_time_step=max_decoding_time_step)
 
-        hypotheses.append(example_hyps)
+            hypotheses.append(example_hyps)
 
     return hypotheses
 
 
 def decode(args: Dict[str, str]):
     """
-    performs decoding on a test set, and save the best-scoring decoding results. 
+    performs decoding on a test set, and save the best-scoring decoding results.
     If the target gold-standard sentences are given, the function also computes
     corpus-level BLEU score.
     """
@@ -350,21 +534,19 @@ def decode(args: Dict[str, str]):
         test_data_tgt = read_corpus(args['TEST_TARGET_FILE'], source='tgt')
 
     print(f"load model from {args['MODEL_PATH']}", file=sys.stderr)
-    model = NMT.load(args['MODEL_PATH'])
+    model = torch.load(args['MODEL_PATH']).to(device)
 
-    hypotheses = beam_search(model, test_data_src,
-                             beam_size=int(args['--beam-size']),
+    hypotheses = greedy_search(model, test_data_src,
                              max_decoding_time_step=int(args['--max-decoding-time-step']))
 
     if args['TEST_TARGET_FILE']:
-        top_hypotheses = [hyps[0] for hyps in hypotheses]
+        top_hypotheses = hypotheses
         bleu_score = compute_corpus_level_bleu_score(test_data_tgt, top_hypotheses)
         print(f'Corpus BLEU: {bleu_score}', file=sys.stderr)
 
     with open(args['OUTPUT_FILE'], 'w') as f:
         for src_sent, hyps in zip(test_data_src, hypotheses):
-            top_hyp = hyps[0]
-            hyp_sent = ' '.join(top_hyp.value)
+            hyp_sent = ' '.join(hyps)
             f.write(hyp_sent + '\n')
 
 
@@ -386,3 +568,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
